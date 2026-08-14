@@ -1,0 +1,29 @@
+mkdir -p ~/.local/share/applications
+nano ~/.local/share/applications/archai.desktop 
+
+arch application pt 1 
+
+[Desktop Entry]
+Name=ArchAI
+Comment=Offline Local AI Assistant
+Exec=/home/YOUR_USERNAME/ArchAI/.venv/bin/python /home/YOUR_USERNAME/ArchAI/archai.py
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;Utility;Science;
+
+arch pt2 
+
+chmod +x ~/.local/share/applications/archai.desktop 
+
+arch pt3 
+
+
+claude verson 
+
+chmod +x install.sh
+./install.sh
+
+pt1
+
+
