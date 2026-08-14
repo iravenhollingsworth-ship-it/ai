@@ -1,0 +1,7 @@
+mkdir -p ~/ArchAI
+cd ~/ArchAI
+python -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install PySide6 sympy llama-cpp-python psutil
