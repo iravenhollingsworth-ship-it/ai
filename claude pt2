@@ -1,0 +1,6 @@
+sudo pacman -S --needed python tk
+pip install --user --break-system-packages sympy
+# get Ollama: yay -S ollama  (or curl -fsSL https://ollama.com/install.sh | sh)
+sudo systemctl enable --now ollama
+ollama pull qwen2.5:14b
+python3 arch_ai.py
