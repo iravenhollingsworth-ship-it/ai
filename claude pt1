@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""
+ArchAI — an offline-capable AI assistant themed for Arch Linux.
+
+- Chat is powered by a local Ollama model (fully offline once the model
+  has been pulled with `ollama pull <model>`). It's tuned for reasoning,
+  explanation, and general knowledge — not coding.
+- Advanced math (`/math ...`) is answered exactly with SymPy, no LLM guessing.
+
+Setup (Arch Linux):
+    sudo pacman -S --needed python tk
+    pip install --user --break-system-packages sympy
+    # install Ollama (AUR: yay -S ollama, or https://ollama.com/download)
+    sudo systemctl enable --now ollama
+    ollama pull qwen2.5:14b
+
+Run:
+    python3 arch_ai.py
+"""
+
+import ast
+import json
+import queue
+import threading
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import ttk, scrolledtext
+import urllib.request
+import urllib.error
+
+import sympy as sp
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+)
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+OLLAMA_URL = "http://localhost:11434"
+FALLBACK_MODEL = "qwen2.5:14b"
+
+SYSTEM_PROMPT = (
+    "You are ArchAI, a knowledgeable, sharp, and thoughtful assistant "
+    "running entirely locally on Arch Linux. You are strong at reasoning, "
+    "explanation, analysis, writing, and general knowledge across science, "
+    "history, philosophy, and everyday topics. You explain advanced "
+    "mathematics clearly and rigorously when asked in plain chat. "
+    "You do NOT write or debug code — if asked for code, briefly decline "
+    "and say coding help isn't something you do, then offer to help with "
+    "the underlying concept, math, or explanation instead. Be direct, "
+    "precise, and avoid padding answers with filler or unnecessary caveats."
+)
+
+HELP_TEXT = (
+    "Commands:\n"
+    "  /math <expression>        e.g. /math 2*x**2 + 3*x - 5 = 0\n"
+    "  /math diff <expr>         derivative w.r.t. x\n"
+    "  /math integrate <expr>    indefinite integral w.r.t. x\n"
+    "  /math limit <expr> at x=<value>\n"
+    "  /math solve <equation>\n"
+    "  /math simplify|expand|factor <expr>\n"
+    "  /math matrix <[[..],[..]]> det|inv|eig\n"
+    "  /clear                    clear conversation history\n"
+    "  /help                     show this message\n"
+    "Anything else is sent to the local model as a normal chat message."
+)
+
+# --------------------------------------------------------------------------
+# Arch Linux color palette
+# --------------------------------------------------------------------------
+BG = "#1c1f26"
+BG_PANEL = "#14161c"
+BG_INPUT = "#20242c"
+FG = "#e6e6e6"
+FG_DIM = "#8a8f98"
+ACCENT = "#1793d1"      # Arch blue
+ACCENT_DIM = "#126ea0"
+USER_COLOR = "#8fd14f"  # Arch-ish green
+AI_COLOR = "#1793d1"
+ERR_COLOR = "#e05561"
+SYS_COLOR = "#c9a227"
+
+MONO_CANDIDATES = ["Terminus", "DejaVu Sans Mono", "Noto Sans Mono", "monospace"]
+
+
+def pick_mono_font(root):
+    families = set(tkfont.families(root))
+    for name in MONO_CANDIDATES:
+        if name in families:
+            return name
+    return "TkFixedFont"
+
+
+# --------------------------------------------------------------------------
+# Math engine (SymPy) — exact, no LLM involved
+# --------------------------------------------------------------------------
+_TRANSFORMS = standard_transformations + (implicit_multiplication_application,)
+_X, _Y, _Z, _T = sp.symbols("x y z t")
+
+
+def _parse(expr_str):
+    return parse_expr(expr_str, transformations=_TRANSFORMS)
+
+
+def _solve_equation(text):
+    if "=" in text:
+        lhs, rhs = text.split("=", 1)
+        eq = sp.Eq(_parse(lhs), _parse(rhs))
+    else:
+        eq = _parse(text)
+    sol = sp.solve(eq)
+    return f"Solutions: {sol}"
+
+
+def _matrix_op(rest):
+    # rest like: "[[1,2],[3,4]] det"  or  "[[1,2],[3,4]] inv"
+    idx = rest.rfind("]")
+    if idx == -1:
+        raise ValueError("expected a matrix literal like [[1,2],[3,4]]")
+    literal, op = rest[: idx + 1].strip(), rest[idx + 1 :].strip().lower()
+    data = ast.literal_eval(literal)
+    m = sp.Matrix(data)
+    if op in ("det", "determinant", ""):
+        return f"det = {m.det()}"
+    if op in ("inv", "inverse"):
+        return f"inverse =\n{m.inv()}"
+    if op in ("eig", "eigen", "eigenvals"):
+        return f"eigenvalues = {m.eigenvals()}"
+    if op in ("rank",):
+        return f"rank = {m.rank()}"
+    if op in ("transpose", "t"):
+        return f"transpose =\n{m.T}"
+    raise ValueError(f"unknown matrix operation '{op}' (try det/inv/eig/rank/transpose)")
+
+
+def run_math(text):
+    """Return a plain-text answer for a /math command body."""
+    text = text.strip()
+    if not text:
+        return "Usage: /math <expression>  (see /help for more forms)"
+    try:
+        parts = text.split(None, 1)
+        op = parts[0].lower()
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if op == "diff" and rest:
+            expr = _parse(rest)
+            return f"d/dx({rest}) = {sp.simplify(sp.diff(expr, _X))}"
+
+        if op == "integrate" and rest:
+            expr = _parse(rest)
+            return f"\u222b({rest}) dx = {sp.integrate(expr, _X)} + C"
+
+        if op == "limit" and rest:
+            if " at " not in rest:
+                raise ValueError("use: limit <expr> at x=<value>")
+            expr_part, at_part = rest.split(" at ", 1)
+            var_str, val_str = at_part.split("=", 1)
+            var = sp.symbols(var_str.strip())
+            val = _parse(val_str.strip())
+            expr = _parse(expr_part.strip())
+            return f"limit({expr_part.strip()}, {var_str.strip()}->{val_str.strip()}) = {sp.limit(expr, var, val)}"
+
+        if op == "solve" and rest:
+            return _solve_equation(rest)
+
+        if op in ("simplify", "expand", "factor") and rest:
+            expr = _parse(rest)
+            fn = getattr(sp, op)
+            return f"{op}({rest}) = {fn(expr)}"
+
+        if op == "matrix" and rest:
+            return _matrix_op(rest)
+
+        # Fallback: no recognised keyword — try equation solve or evaluate.
+        if "=" in text:
+            return _solve_equation(text)
+
+        expr = _parse(text)
+        simplified = sp.simplify(expr)
+        try:
+            numeric = sp.N(simplified)
+        except Exception:
+            numeric = None
+        if numeric is not None and str(numeric) != str(simplified):
+            return f"= {simplified}   \u2248 {numeric}"
+        return f"= {simplified}"
+
+    except Exception as e:  # noqa: BLE001 — surface any parse/math error to the user
+        return f"Math error: {e}"
+
+
+# --------------------------------------------------------------------------
+# Ollama client (stdlib only, streaming)
+# --------------------------------------------------------------------------
+def list_models():
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            names = [m["name"] for m in data.get("models", [])]
+            return names or [FALLBACK_MODEL]
+    except Exception:
+        return [FALLBACK_MODEL]
+
+
+def stream_chat(model, messages, chunk_queue, stop_event):
+    """Streams assistant tokens into chunk_queue as ('token', text) events,
+    then a final ('done', None) or ('error', message) event."""
+    body = json.dumps({"model": model, "messages": messages, "stream": True}).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for raw_line in resp:
+                if stop_event.is_set():
+                    return
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                token = obj.get("message", {}).get("content", "")
+                if token:
+                    chunk_queue.put(("token", token))
+                if obj.get("done"):
+                    chunk_queue.put(("done", None))
+                    return
+    except urllib.error.URLError as e:
+        chunk_queue.put((
+            "error",
+            f"Could not reach Ollama at {OLLAMA_URL} ({e}).\n"
+            "Is the service running? Try: sudo systemctl start ollama",
+        ))
+    except Exception as e:  # noqa: BLE001
+        chunk_queue.put(("error", str(e)))
+
+
+# --------------------------------------------------------------------------
+# GUI
+# --------------------------------------------------------------------------
+class ArchAIApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ArchAI")
+        self.root.configure(bg=BG)
+        self.root.geometry("880x640")
+        self.root.minsize(560, 420)
+
+        self.mono = pick_mono_font(root)
+        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.chunk_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.busy = False
+
+        self._build_style()
+        self._build_layout()
+        self._greet()
+        self._poll_queue()
+
+    # ---------------- UI construction ----------------
+    def _build_style(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Arch.TFrame", background=BG)
+        style.configure("ArchPanel.TFrame", background=BG_PANEL)
+        style.configure(
+            "Arch.TButton",
+            background=ACCENT,
+            foreground="#0b0c0f",
+            font=(self.mono, 10, "bold"),
+            borderwidth=0,
+            focuscolor=ACCENT,
+            padding=6,
+        )
+        style.map("Arch.TButton", background=[("active", ACCENT_DIM)])
+        style.configure(
+            "Arch.TMenubutton",
+            background=BG_INPUT,
+            foreground=FG,
+            font=(self.mono, 10),
+        )
+        style.configure("Arch.TLabel", background=BG_PANEL, foreground=ACCENT, font=(self.mono, 11, "bold"))
+        style.configure("ArchDim.TLabel", background=BG_PANEL, foreground=FG_DIM, font=(self.mono, 9))
+
+    def _build_layout(self):
+        # Top bar
+        top = ttk.Frame(self.root, style="ArchPanel.TFrame")
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        title = tk.Label(
+            top, text="  \u25b2 ArchAI", bg=BG_PANEL, fg=ACCENT,
+            font=(self.mono, 14, "bold"), anchor="w",
+        )
+        title.pack(side=tk.LEFT, padx=8, pady=8)
+
+        self.model_var = tk.StringVar(value="loading...")
+        models = list_models()
+        self.model_var.set(models[0])
+        model_menu = ttk.OptionMenu(top, self.model_var, models[0], *models, style="Arch.TMenubutton")
+        model_menu.pack(side=tk.RIGHT, padx=8, pady=8)
+        ttk.Label(top, text="model:", style="ArchDim.TLabel").pack(side=tk.RIGHT)
+
+        clear_btn = ttk.Button(top, text="Clear", style="Arch.TButton", command=self.clear_chat)
+        clear_btn.pack(side=tk.RIGHT, padx=(0, 12))
+
+        # Chat log
+        self.chat_log = scrolledtext.ScrolledText(
+            self.root,
+            bg=BG,
+            fg=FG,
+            insertbackground=FG,
+            font=(self.mono, 11),
+            wrap=tk.WORD,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=10,
+            pady=10,
+        )
+        self.chat_log.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.chat_log.tag_config("user", foreground=USER_COLOR, font=(self.mono, 11, "bold"))
+        self.chat_log.tag_config("ai", foreground=AI_COLOR, font=(self.mono, 11, "bold"))
+        self.chat_log.tag_config("sys", foreground=SYS_COLOR, font=(self.mono, 10, "italic"))
+        self.chat_log.tag_config("err", foreground=ERR_COLOR)
+        self.chat_log.tag_config("body", foreground=FG)
+        self.chat_log.configure(state=tk.DISABLED)
+
+        # Input bar
+        bottom = ttk.Frame(self.root, style="ArchPanel.TFrame")
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.input_var = tk.StringVar()
+        self.entry = tk.Entry(
+            bottom,
+            textvariable=self.input_var,
+            bg=BG_INPUT,
+            fg=FG,
+            insertbackground=FG,
+            font=(self.mono, 11),
+            relief=tk.FLAT,
+        )
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4), pady=8, ipady=6)
+        self.entry.bind("<Return>", lambda e: self.send())
+        self.entry.focus_set()
+
+        send_btn = ttk.Button(bottom, text="Send", style="Arch.TButton", command=self.send)
+        send_btn.pack(side=tk.RIGHT, padx=(4, 8), pady=8)
+
+    # ---------------- Chat log helpers ----------------
+    def _append(self, text, tag="body", newline=True):
+        self.chat_log.configure(state=tk.NORMAL)
+        self.chat_log.insert(tk.END, text + ("\n" if newline else ""), tag)
+        self.chat_log.see(tk.END)
+        self.chat_log.configure(state=tk.DISABLED)
+
+    def _greet(self):
+        self._append("ArchAI ready.", "sys")
+        self._append(HELP_TEXT, "sys")
+        self._append("")
+
+    def clear_chat(self):
+        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.chat_log.configure(state=tk.NORMAL)
+        self.chat_log.delete("1.0", tk.END)
+        self.chat_log.configure(state=tk.DISABLED)
+        self._greet()
+
+    # ---------------- Sending / receiving ----------------
+    def send(self):
+        if self.busy:
+            return
+        text = self.input_var.get().strip()
+        if not text:
+            return
+        self.input_var.set("")
+        self._append(f"you> {text}", "user")
+
+        if text in ("/help", "help"):
+            self._append(HELP_TEXT, "sys")
+            return
+        if text == "/clear":
+            self.clear_chat()
+            return
+        if text.startswith("/math"):
+            body = text[len("/math"):].strip()
+            result = run_math(body)
+            self._append(f"math> {result}", "ai")
+            self._append("")
+            return
+
+        # Normal chat -> Ollama
+        self.history.append({"role": "user", "content": text})
+        self._append("archai> ", "ai", newline=False)
+        self.busy = True
+        self.stop_event = threading.Event()
+        threading.Thread(
+            target=stream_chat,
+            args=(self.model_var.get(), self.history, self.chunk_queue, self.stop_event),
+            daemon=True,
+        ).start()
+        self._current_reply = ""
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.chunk_queue.get_nowait()
+                if kind == "token":
+                    self.chat_log.configure(state=tk.NORMAL)
+                    self.chat_log.insert(tk.END, payload, "body")
+                    self.chat_log.see(tk.END)
+                    self.chat_log.configure(state=tk.DISABLED)
+                    self._current_reply += payload
+                elif kind == "done":
+                    self._append("")
+                    self._append("")
+                    self.history.append({"role": "assistant", "content": self._current_reply})
+                    self.busy = False
+                elif kind == "error":
+                    self._append(payload, "err")
+                    self._append("")
+                    self.busy = False
+        except queue.Empty:
+            pass
+        self.root.after(40, self._poll_queue)
+
+
+def main():
+    root = tk.Tk()
+    try:
+        root.tk.call("tk", "scaling", 1.2)
+    except tk.TclError:
+        pass
+    app = ArchAIApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
